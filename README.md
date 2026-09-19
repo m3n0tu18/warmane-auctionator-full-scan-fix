@@ -8,13 +8,12 @@ A small compatibility patch for the old **Auctionator 2.6.8-style WotLK 3.3.5a a
 ---
 
 ## Version
-Version 1.0 - Intial Release
+Version 1.0.0 - Initial Release
 
 ## Screenshot
 
-```md
 ![Auctionator Full Scan running on Warmane](docs/full-scan-progress.png)
-```
+
 
 ---
 
