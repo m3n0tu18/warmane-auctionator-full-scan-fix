@@ -12,6 +12,46 @@ It replaces the unreliable `getAll` Full Scan path with safer paginated scanning
 
 **Version 1.0.1**
 
+## TLDR
+1. Locate your WoW installation and open:
+
+```text
+Interface/AddOns/Auctionator/
+```
+
+2. Make a backup of:
+
+```text
+AuctionatorScan.lua
+```
+
+For example:
+
+```text
+AuctionatorScan.lua.backup
+```
+
+3. Download `AuctionatorScan.lua` from:
+
+https://github.com/m3n0tu18/warmane-auctionator-full-scan-fix
+
+4. Replace:
+
+```text
+Interface/AddOns/Auctionator/AuctionatorScan.lua
+```
+
+with the patched version.
+
+No other Auctionator files need to be replaced for this patch.
+
+5. Restart WoW
+
+A complete restart of the WoW client is recommended after replacing the file.
+
+..End..
+
+
 ### v1.0.1 highlights
 
 - Smart Quick Refresh for bags, cached bank contents, shopping lists, and Recent Searches
