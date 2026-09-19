@@ -1,4 +1,4 @@
--- v1.0 - Initial Release
+-- v1.0.1 - Smart Quick Refresh + disenchant pricing + sell recommendations + database controls
 local addonName, addonTable = ...; 
 local zc = addonTable.zc;
 
@@ -1082,6 +1082,115 @@ local gAtr_FullScanNumEachQual            = nil;
 local gAtr_FullScanNumRemoved             = nil;
 local gAtr_FullScanTotalItems             = 0;
 
+-- ==========================================================
+-- v1.0.1 Quick Refresh / market metadata
+-- ==========================================================
+--
+-- Quick Refresh is deliberately separate from Full Scan.
+-- Full Scan remains the market-wide baseline, while Quick Refresh
+-- asks the AH only about items that are immediately useful to the
+-- player: bags, a cached bank snapshot, shopping lists and recent
+-- exact item searches.
+--
+-- The bank cannot normally be open at the same time as the Auction
+-- House. For that reason we snapshot auctionable bank item names when
+-- the bank is opened and reuse that snapshot later at the AH.
+-- ==========================================================
+
+local ATR_MARKET_META_KEY                  = "MARKET_ITEM_META_V1";
+local ATR_QUICK_BANK_CACHE_KEY             = "QUICK_REFRESH_BANK_CACHE_V1";
+local ATR_QUICK_RESPONSE_TIMEOUT           = 15.00;
+local ATR_QUICK_STALE_POLL_TIMEOUT         = 1.25;
+local ATR_QUICK_MAX_RETRIES                = 6;
+local ATR_QUICK_ETA_SAMPLE_COUNT           = 15;
+
+-- Reuse recently checked prices instead of querying Warmane again.
+-- This is the main reason repeated Quick Refreshes can complete much
+-- faster than the first run.
+local ATR_QUICK_FRESH_SECONDS              = 15 * 60;
+
+local gAtr_QuickRefreshActive              = false;
+local gAtr_QuickRefreshQueue               = {};
+local gAtr_QuickRefreshIndex               = 1;
+local gAtr_QuickRefreshPage                = 0;
+local gAtr_QuickRefreshAwaitingResponse    = false;
+local gAtr_QuickRefreshQuerySentAt         = nil;
+local gAtr_QuickRefreshStaleStartedAt      = nil;
+local gAtr_QuickRefreshRetries             = 0;
+local gAtr_QuickRefreshLastSignature       = nil;
+local gAtr_QuickRefreshLowprices           = nil;
+local gAtr_QuickRefreshQuality             = nil;
+local gAtr_QuickRefreshItemStartedAt       = nil;
+local gAtr_QuickRefreshStartedAt           = nil;
+local gAtr_QuickRefreshDurations           = {};
+local gAtr_QuickRefreshUpdated             = 0;
+local gAtr_QuickRefreshAdded               = 0;
+local gAtr_QuickRefreshUnchanged           = 0;
+local gAtr_QuickRefreshNoAuctions          = 0;
+local gAtr_QuickRefreshSkipped             = 0;
+local gAtr_QuickRefreshFreshSkipped        = 0;
+local gAtr_QuickRefreshCandidateCount      = 0;
+local gAtr_QuickRefreshBankOpen            = false;
+local gAtr_QuickRefreshDEMaterialCount      = 0;
+
+-- ==========================================================
+-- Disenchant material support
+-- ==========================================================
+--
+-- Auctionator's existing disenchant calculator values an item
+-- by looking up the current AH prices of the possible dusts,
+-- essences, shards and crystals. A narrow Quick Refresh can
+-- therefore leave "Disenchant: unknown" even when the equipment
+-- itself has just been refreshed.
+--
+-- Include the standard Vanilla / TBC / WotLK disenchant materials
+-- in Quick Refresh so AuctionatorHints.lua can use its ORIGINAL
+-- disenchant formula without any changes to that file.
+--
+-- IDs are preferred so localized clients can resolve their own
+-- names. English names are retained as a fallback when an item is
+-- not yet present in the local item cache.
+-- ==========================================================
+
+local ATR_QUICK_DE_MATERIALS = {
+    { id = 10938, name = "Lesser Magic Essence" },
+    { id = 10939, name = "Greater Magic Essence" },
+    { id = 10940, name = "Strange Dust" },
+    { id = 10978, name = "Small Glimmering Shard" },
+    { id = 10998, name = "Lesser Astral Essence" },
+    { id = 11082, name = "Greater Astral Essence" },
+    { id = 11083, name = "Soul Dust" },
+    { id = 11084, name = "Large Glimmering Shard" },
+    { id = 11134, name = "Lesser Mystic Essence" },
+    { id = 11135, name = "Greater Mystic Essence" },
+    { id = 11137, name = "Vision Dust" },
+    { id = 11138, name = "Small Glowing Shard" },
+    { id = 11139, name = "Large Glowing Shard" },
+    { id = 11174, name = "Lesser Nether Essence" },
+    { id = 11175, name = "Greater Nether Essence" },
+    { id = 11176, name = "Dream Dust" },
+    { id = 11177, name = "Small Radiant Shard" },
+    { id = 11178, name = "Large Radiant Shard" },
+    { id = 14343, name = "Small Brilliant Shard" },
+    { id = 14344, name = "Large Brilliant Shard" },
+    { id = 16202, name = "Lesser Eternal Essence" },
+    { id = 16203, name = "Greater Eternal Essence" },
+    { id = 16204, name = "Illusion Dust" },
+    { id = 20725, name = "Nexus Crystal" },
+    { id = 22445, name = "Arcane Dust" },
+    { id = 22446, name = "Greater Planar Essence" },
+    { id = 22447, name = "Lesser Planar Essence" },
+    { id = 22448, name = "Small Prismatic Shard" },
+    { id = 22449, name = "Large Prismatic Shard" },
+    { id = 22450, name = "Void Crystal" },
+    { id = 34052, name = "Dream Shard" },
+    { id = 34053, name = "Small Dream Shard" },
+    { id = 34054, name = "Infinite Dust" },
+    { id = 34055, name = "Greater Cosmic Essence" },
+    { id = 34056, name = "Lesser Cosmic Essence" },
+    { id = 34057, name = "Abyss Crystal" }
+};
+
 -----------------------------------------
 
 function Atr_GetDBsize()
@@ -1247,6 +1356,356 @@ local function Atr_FullScanGetScope ()
     end
 
     return realm, faction;
+end
+
+-----------------------------------------
+-- Market metadata helpers
+-----------------------------------------
+
+local function Atr_MarketMetaGetScopeKey ()
+
+    local realm, faction = Atr_FullScanGetScope();
+
+    return tostring(realm)
+        .. "|"
+        .. tostring(faction);
+end
+
+-----------------------------------------
+
+local function Atr_MarketMetaGetStore ()
+
+    Atr_FullScanEnsureSavedVars();
+
+    local root = AUCTIONATOR_SAVEDVARS[ATR_MARKET_META_KEY];
+
+    if (type(root) ~= "table" or root.version ~= 1) then
+
+        root = {
+            version = 1,
+            scopes = {}
+        };
+
+        AUCTIONATOR_SAVEDVARS[ATR_MARKET_META_KEY] = root;
+    end
+
+    if (type(root.scopes) ~= "table") then
+        root.scopes = {};
+    end
+
+    local scopeKey = Atr_MarketMetaGetScopeKey();
+
+    if (type(root.scopes[scopeKey]) ~= "table") then
+        root.scopes[scopeKey] = {};
+    end
+
+    return root.scopes[scopeKey];
+end
+
+-----------------------------------------
+
+local function Atr_MarketMetaMarkSeen (name, price, source)
+
+    if (not name or not price or price <= 0) then
+        return;
+    end
+
+    local store = Atr_MarketMetaGetStore();
+    local meta = store[name];
+
+    if (type(meta) ~= "table") then
+        meta = {};
+        store[name] = meta;
+    end
+
+    if (
+        meta.currentPrice
+        and meta.currentPrice ~= price
+    ) then
+        meta.previousPrice = meta.currentPrice;
+    end
+
+    meta.currentPrice = price;
+    meta.lastSeen = time();
+    meta.lastChecked = time();
+    meta.stale = false;
+    meta.source = source or "scan";
+end
+
+-----------------------------------------
+
+local function Atr_MarketMetaMarkMissing (name, source)
+
+    if (not name) then
+        return;
+    end
+
+    local store = Atr_MarketMetaGetStore();
+    local meta = store[name];
+
+    if (type(meta) ~= "table") then
+        meta = {};
+        store[name] = meta;
+    end
+
+    -- Keep the last known price. Auctionator intentionally uses its
+    -- historical database when there are no current auctions, so a
+    -- missing item is marked stale rather than deleting useful data.
+    meta.lastChecked = time();
+    meta.stale = true;
+    meta.source = source or "scan";
+end
+
+-----------------------------------------
+
+local function Atr_MarketMetaMarkFullScanStale ()
+
+    if (not gAtr_FullScanLowprices) then
+        return;
+    end
+
+    local name;
+
+    for name in pairs (gAtr_ScanDB) do
+
+        if (not gAtr_FullScanLowprices[name]) then
+            Atr_MarketMetaMarkMissing (name, "full");
+        end
+    end
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshIsFresh (name)
+
+    if (
+        not name
+        or type(AUCTIONATOR_SAVEDVARS) ~= "table"
+    ) then
+        return false;
+    end
+
+    local root =
+        AUCTIONATOR_SAVEDVARS[ATR_MARKET_META_KEY];
+
+    if (
+        type(root) ~= "table"
+        or root.version ~= 1
+        or type(root.scopes) ~= "table"
+    ) then
+        return false;
+    end
+
+    local store =
+        root.scopes[
+            Atr_MarketMetaGetScopeKey()
+        ];
+
+    if (type(store) ~= "table") then
+        return false;
+    end
+
+    local meta = store[name];
+
+    if (
+        type(meta) ~= "table"
+        or not meta.lastChecked
+    ) then
+        return false;
+    end
+
+    local checkedAt =
+        tonumber (meta.lastChecked);
+
+    if (not checkedAt) then
+        return false;
+    end
+
+    local age =
+        time() - checkedAt;
+
+    return (
+        age >= 0
+        and age < ATR_QUICK_FRESH_SECONDS
+    );
+end
+
+-----------------------------------------
+-- Cached bank snapshot helpers
+-----------------------------------------
+
+local function Atr_QuickRefreshGetCharacterScopeKey ()
+
+    local realm, faction = Atr_FullScanGetScope();
+    local player = UnitName and UnitName("player") or "";
+
+    return tostring(realm)
+        .. "|"
+        .. tostring(faction)
+        .. "|"
+        .. tostring(player or "");
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshGetBankCacheRoot ()
+
+    Atr_FullScanEnsureSavedVars();
+
+    local root =
+        AUCTIONATOR_SAVEDVARS[ATR_QUICK_BANK_CACHE_KEY];
+
+    if (type(root) ~= "table" or root.version ~= 1) then
+
+        root = {
+            version = 1,
+            characters = {}
+        };
+
+        AUCTIONATOR_SAVEDVARS[ATR_QUICK_BANK_CACHE_KEY] = root;
+    end
+
+    if (type(root.characters) ~= "table") then
+        root.characters = {};
+    end
+
+    return root;
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshGetBankCache ()
+
+    if (type(AUCTIONATOR_SAVEDVARS) ~= "table") then
+        return nil;
+    end
+
+    local root =
+        AUCTIONATOR_SAVEDVARS[ATR_QUICK_BANK_CACHE_KEY];
+
+    if (
+        type(root) ~= "table"
+        or root.version ~= 1
+        or type(root.characters) ~= "table"
+    ) then
+        return nil;
+    end
+
+    return root.characters[
+        Atr_QuickRefreshGetCharacterScopeKey()
+    ];
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshIsBagItemAuctionable (
+    bag,
+    slot,
+    link,
+    quality
+)
+
+    if (not link) then
+        return false;
+    end
+
+    if (Atr_IsItemSellableOnAH) then
+
+        local ok, result = pcall (
+            Atr_IsItemSellableOnAH,
+            bag,
+            slot,
+            link,
+            quality
+        );
+
+        if (ok) then
+            return result and true or false;
+        end
+    end
+
+    -- If the optional Auctionator helper is unavailable, keep the
+    -- item. The AH query itself is still read-only and safe.
+    return true;
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshSnapshotBank ()
+
+    if (not gAtr_QuickRefreshBankOpen) then
+        return;
+    end
+
+    local items = {};
+    local seen = {};
+
+    local function addContainer (bag)
+
+        local numSlots = GetContainerNumSlots (bag) or 0;
+        local slot;
+
+        for slot = 1, numSlots do
+
+            local texture, count, locked, quality,
+                readable, lootable, itemLink =
+                GetContainerItemInfo (bag, slot);
+
+            local link =
+                itemLink or GetContainerItemLink (bag, slot);
+
+            if (
+                link
+                and Atr_QuickRefreshIsBagItemAuctionable (
+                    bag,
+                    slot,
+                    link,
+                    quality
+                )
+            ) then
+
+                local itemName, canonicalLink =
+                    GetItemInfo (link);
+
+                if (itemName) then
+
+                    local key = string.lower (itemName);
+
+                    if (not seen[key]) then
+
+                        seen[key] = true;
+
+                        table.insert (
+                            items,
+                            {
+                                name = itemName,
+                                link = canonicalLink or link
+                            }
+                        );
+                    end
+                end
+            end
+        end
+    end
+
+    addContainer (BANK_CONTAINER or -1);
+
+    local firstBankBag = (NUM_BAG_SLOTS or 4) + 1;
+    local bankBagCount = NUM_BANKBAGSLOTS or 7;
+    local bag;
+
+    for bag = firstBankBag, firstBankBag + bankBagCount - 1 do
+        addContainer (bag);
+    end
+
+    local root = Atr_QuickRefreshGetBankCacheRoot();
+
+    root.characters[
+        Atr_QuickRefreshGetCharacterScopeKey()
+    ] = {
+        updatedAt = time(),
+        items = items
+    };
 end
 
 -----------------------------------------
@@ -1507,6 +1966,1720 @@ local function Atr_FullScanPageSignature (numBatchAuctions)
     end
 
     return table.concat (parts, "|");
+end
+
+-----------------------------------------
+-- Quick Refresh engine
+-----------------------------------------
+
+local function Atr_QuickRefreshNamesSame (a, b)
+
+    if (not a or not b) then
+        return false;
+    end
+
+    if (zc and zc.StringSame) then
+        return zc.StringSame (a, b);
+    end
+
+    return string.lower(a) == string.lower(b);
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshBuildEntry (name, link, source, forceInclude)
+
+    if (not name and not link) then
+        return nil;
+    end
+
+    local candidate = link or name;
+
+    if (
+        not link
+        and Atr_GetItemLink
+        and name
+    ) then
+        candidate = Atr_GetItemLink (name) or name;
+    end
+
+    local itemName, itemLink, quality,
+        itemLevel, reqLevel, itemType, itemSubType =
+        GetItemInfo (candidate);
+
+    -- Shopping-list history can contain broad text searches. Only
+    -- add normal entries that resolve to a real item so Quick Refresh
+    -- does not accidentally turn into another market-wide scan.
+    --
+    -- Disenchant materials are a controlled built-in list, so they may
+    -- fall back to the supplied name while the client item cache warms.
+    if (not itemName or not itemLink) then
+
+        if (
+            forceInclude
+            and type(name) == "string"
+            and name ~= ""
+        ) then
+
+            itemName = name;
+            itemLink = link;
+            quality = quality or 1;
+
+        else
+            return nil;
+        end
+    end
+
+    if (
+        not forceInclude
+        and quality ~= nil
+        and AUCTIONATOR_SCAN_MINLEVEL
+        and quality + 1 < AUCTIONATOR_SCAN_MINLEVEL
+    ) then
+        return nil;
+    end
+
+    local itemClass = 0;
+    local itemSubclass = 0;
+
+    if (itemType) then
+        itemClass =
+            Atr_ItemType2AuctionClass (itemType) or 0;
+    end
+
+    if (itemClass > 0 and itemSubType) then
+        itemSubclass =
+            Atr_SubType2AuctionSubclass (
+                itemClass,
+                itemSubType
+            ) or 0;
+    end
+
+    return {
+        name = itemName,
+        link = itemLink,
+        quality = quality,
+        itemLevel = itemLevel,
+        itemType = itemType,
+        itemClass = itemClass,
+        itemSubclass = itemSubclass,
+        source = source
+    };
+end
+
+-----------------------------------------
+-- Determine which disenchant materials an item can produce
+-----------------------------------------
+
+local function Atr_QuickRefreshGetDEMaterialIDs (entry)
+
+    local ids = {};
+
+    if (
+        not entry
+        or not entry.quality
+        or not entry.itemLevel
+        or (
+            entry.itemClass ~= AUCTION_CLASS_WEAPON
+            and entry.itemClass ~= AUCTION_CLASS_ARMOR
+        )
+    ) then
+        return ids;
+    end
+
+    local quality = entry.quality;
+    local level = entry.itemLevel;
+
+    -- ----------------------------------------------------------
+    -- Uncommon / green
+    -- ----------------------------------------------------------
+    if (quality == 2) then
+
+        if (level >= 5 and level <= 15) then
+            return {10940, 10938}; -- Strange Dust, Lesser Magic
+        elseif (level <= 20) then
+            return {10940, 10939, 10978};
+        elseif (level <= 25) then
+            return {10940, 10998, 10978};
+        elseif (level <= 30) then
+            return {11083, 11082, 11084};
+        elseif (level <= 35) then
+            return {11083, 11134, 11138};
+        elseif (level <= 40) then
+            return {11137, 11135, 11139};
+        elseif (level <= 45) then
+            return {11137, 11174, 11177};
+        elseif (level <= 50) then
+            return {11176, 11175, 11178};
+        elseif (level <= 55) then
+            return {11176, 16202, 14343};
+        elseif (level <= 65) then
+            return {16204, 16203, 14344};
+        elseif (level <= 99) then
+            return {22445, 22447, 22448};
+        elseif (level <= 120) then
+            return {22445, 22446, 22449};
+        elseif (level <= 151) then
+            return {34054, 34056, 34053};
+        elseif (level <= 200) then
+            return {34054, 34055, 34052};
+        end
+
+    -- ----------------------------------------------------------
+    -- Rare / blue
+    -- ----------------------------------------------------------
+    elseif (quality == 3) then
+
+        if (level >= 11 and level <= 25) then
+            return {10978};
+        elseif (level >= 26 and level <= 30) then
+            return {11084};
+        elseif (level >= 31 and level <= 35) then
+            return {11138};
+        elseif (level >= 36 and level <= 40) then
+            return {11139};
+        elseif (level >= 41 and level <= 45) then
+            return {11177};
+        elseif (level >= 46 and level <= 50) then
+            return {11178};
+        elseif (level >= 51 and level <= 55) then
+            return {14343};
+        elseif (level >= 56 and level <= 65) then
+            return {14344, 20725};
+        elseif (level >= 66 and level <= 99) then
+            return {22448, 20725};
+        elseif (level >= 100 and level <= 120) then
+            return {22449, 22450};
+        elseif (level >= 121 and level <= 164) then
+            return {34053, 34057};
+        elseif (level >= 165) then
+            return {34052, 34057};
+        end
+
+    -- ----------------------------------------------------------
+    -- Epic / purple
+    -- ----------------------------------------------------------
+    elseif (quality == 4) then
+
+        if (level >= 40 and level <= 45) then
+            return {11177};
+        elseif (level >= 46 and level <= 50) then
+            return {11178};
+        elseif (level >= 51 and level <= 55) then
+            return {14343};
+        elseif (level >= 56 and level <= 80) then
+            return {20725};
+        elseif (level >= 95 and level <= 100) then
+            return {22450};
+        elseif (level >= 105 and level <= 164) then
+            return {22450};
+        elseif (level >= 165) then
+            return {34057};
+        end
+    end
+
+    return ids;
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshBuildQueue ()
+
+    local queue = {};
+    local seen = {};
+    local requiredDEMaterials = {};
+
+    local function rememberDEMaterials (entry)
+
+        if (
+            not entry
+            or entry.source == "disenchant-material"
+        ) then
+            return;
+        end
+
+        local ids =
+            Atr_QuickRefreshGetDEMaterialIDs (
+                entry
+            );
+
+        local _, itemID;
+
+        for _, itemID in ipairs (ids) do
+            requiredDEMaterials[itemID] = true;
+        end
+    end
+
+    local function add (
+        name,
+        link,
+        source,
+        forceInclude
+    )
+
+        local entry =
+            Atr_QuickRefreshBuildEntry (
+                name,
+                link,
+                source,
+                forceInclude
+            );
+
+        if (not entry) then
+            return false;
+        end
+
+        local key =
+            string.lower (entry.name);
+
+        if (seen[key]) then
+            return false;
+        end
+
+        -- Mark the item as seen before applying freshness. A duplicate
+        -- from another source should not be queried simply because the
+        -- first copy was already fresh.
+        seen[key] = true;
+
+        gAtr_QuickRefreshCandidateCount =
+            gAtr_QuickRefreshCandidateCount + 1;
+
+        -- Even if the equipment itself is still fresh, its possible
+        -- disenchant outputs may not be. Work out those dependencies
+        -- before deciding whether this entry needs an AH query.
+        rememberDEMaterials (entry);
+
+        if (
+            Atr_QuickRefreshIsFresh (
+                entry.name
+            )
+        ) then
+
+            gAtr_QuickRefreshFreshSkipped =
+                gAtr_QuickRefreshFreshSkipped + 1;
+
+            return false;
+        end
+
+        table.insert (
+            queue,
+            entry
+        );
+
+        return true;
+    end
+
+    -- ----------------------------------------------------------
+    -- Current bags
+    -- ----------------------------------------------------------
+    local bag;
+
+    for bag = 0, (NUM_BAG_SLOTS or 4) do
+
+        local numSlots =
+            GetContainerNumSlots (bag) or 0;
+
+        local slot;
+
+        for slot = 1, numSlots do
+
+            local texture, count, locked, quality,
+                readable, lootable, itemLink =
+                GetContainerItemInfo (
+                    bag,
+                    slot
+                );
+
+            local link =
+                itemLink
+                or GetContainerItemLink (
+                    bag,
+                    slot
+                );
+
+            if (
+                link
+                and Atr_QuickRefreshIsBagItemAuctionable (
+                    bag,
+                    slot,
+                    link,
+                    quality
+                )
+            ) then
+
+                add (
+                    nil,
+                    link,
+                    "bag"
+                );
+            end
+        end
+    end
+
+    -- ----------------------------------------------------------
+    -- Last bank snapshot
+    -- ----------------------------------------------------------
+    local bankCache =
+        Atr_QuickRefreshGetBankCache();
+
+    if (
+        bankCache
+        and type(bankCache.items) == "table"
+    ) then
+
+        local _, bankItem;
+
+        for _, bankItem in ipairs (bankCache.items) do
+
+            if (type(bankItem) == "table") then
+
+                add (
+                    bankItem.name,
+                    bankItem.link,
+                    "bank"
+                );
+            end
+        end
+    end
+
+    -- ----------------------------------------------------------
+    -- Shopping lists + Recent Searches
+    -- ----------------------------------------------------------
+    if (type(AUCTIONATOR_SHOPPING_LISTS) == "table") then
+
+        local _, slist;
+
+        for _, slist in ipairs (
+            AUCTIONATOR_SHOPPING_LISTS
+        ) do
+
+            if (
+                type(slist) == "table"
+                and type(slist.items) == "table"
+            ) then
+
+                local _, itemName;
+
+                for _, itemName in ipairs (
+                    slist.items
+                ) do
+
+                    add (
+                        itemName,
+                        nil,
+                        "list"
+                    );
+                end
+            end
+        end
+    end
+
+    -- ----------------------------------------------------------
+    -- Only the disenchant materials actually required by the
+    -- equipment above.
+    -- ----------------------------------------------------------
+    --
+    -- Walk the master catalogue in its stable order, but enqueue
+    -- only IDs referenced by the relevant green/blue/purple gear.
+    local _, material;
+
+    for _, material in ipairs (
+        ATR_QUICK_DE_MATERIALS
+    ) do
+
+        if (
+            requiredDEMaterials[material.id]
+        ) then
+
+            local materialName, materialLink =
+                GetItemInfo (material.id);
+
+            if (
+                not materialName
+                and AtrScanningTooltip
+                and AtrScanningTooltip.SetHyperlink
+            ) then
+
+                pcall (
+                    AtrScanningTooltip.SetHyperlink,
+                    AtrScanningTooltip,
+                    "item:"
+                        .. tostring(material.id)
+                        .. ":0:0:0:0:0:0:0"
+                );
+
+                materialName, materialLink =
+                    GetItemInfo (material.id);
+            end
+
+            local before = #queue;
+
+            add (
+                materialName or material.name,
+                materialLink,
+                "disenchant-material",
+                true
+            );
+
+            if (#queue > before) then
+
+                gAtr_QuickRefreshDEMaterialCount =
+                    gAtr_QuickRefreshDEMaterialCount + 1;
+            end
+        end
+    end
+
+    return queue;
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshPageSignature (numBatchAuctions)
+
+    if (not numBatchAuctions or numBatchAuctions <= 0) then
+        return "empty";
+    end
+
+    local middle = math.floor ((numBatchAuctions + 1) / 2);
+    local indexes = {1, middle, numBatchAuctions};
+    local parts = { tostring(numBatchAuctions) };
+    local i;
+
+    for i = 1, #indexes do
+
+        local x = indexes[i];
+
+        local name, texture, count, quality, canUse, level,
+            minBid, minIncrement, buyoutPrice, bidAmount,
+            highBidder, owner =
+            GetAuctionItemInfo ("list", x);
+
+        table.insert (
+            parts,
+            tostring(name or "?")
+            .. "/" .. tostring(count or 0)
+            .. "/" .. tostring(buyoutPrice or 0)
+            .. "/" .. tostring(bidAmount or 0)
+            .. "/" .. tostring(owner or "?")
+        );
+    end
+
+    return table.concat (parts, "|");
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshCurrentEntry ()
+
+    return gAtr_QuickRefreshQueue[
+        gAtr_QuickRefreshIndex
+    ];
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshAverageItemSeconds ()
+
+    if (#gAtr_QuickRefreshDurations == 0) then
+        return nil;
+    end
+
+    local total = 0;
+    local i;
+
+    for i = 1, #gAtr_QuickRefreshDurations do
+        total = total + gAtr_QuickRefreshDurations[i];
+    end
+
+    return total / #gAtr_QuickRefreshDurations;
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshUpdateStatus ()
+
+    if (not Atr_FullScanStatus) then
+        return;
+    end
+
+    local entry = Atr_QuickRefreshCurrentEntry();
+    local total = #gAtr_QuickRefreshQueue;
+    local average = Atr_QuickRefreshAverageItemSeconds();
+    local eta = "calculating...";
+
+    if (average and average > 0) then
+
+        local remainingItems =
+            math.max (0, total - gAtr_QuickRefreshIndex);
+
+        eta = Atr_FullScanFormatRemaining (
+            average * remainingItems
+        );
+    end
+
+    local itemText =
+        entry and entry.name or "Finishing...";
+
+    if (
+        entry
+        and entry.source == "disenchant-material"
+    ) then
+        itemText = itemText .. "  [DE material]";
+    end
+
+    Atr_FullScanStatus:SetText (
+        string.format (
+            "Quick Refresh: %d / %d\n%s\nRemaining: ~%s  |  %d fresh",
+            math.min (gAtr_QuickRefreshIndex, total),
+            total,
+            itemText,
+            eta,
+            gAtr_QuickRefreshFreshSkipped
+        )
+    );
+
+    if (Atr_FullScanDBsize) then
+        Atr_FullScanDBsize:SetText (Atr_GetDBsize());
+    end
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshResetItem ()
+
+    gAtr_QuickRefreshPage = 0;
+    gAtr_QuickRefreshAwaitingResponse = false;
+    gAtr_QuickRefreshQuerySentAt = nil;
+    gAtr_QuickRefreshStaleStartedAt = nil;
+    gAtr_QuickRefreshRetries = 0;
+    gAtr_QuickRefreshLowprices = {
+        BIGNUM,
+        BIGNUM,
+        BIGNUM
+    };
+    gAtr_QuickRefreshQuality = nil;
+    gAtr_QuickRefreshItemStartedAt = GetTime();
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshSendPage ()
+
+    if (
+        not gAtr_QuickRefreshActive
+        or gAtr_FullScanState ~= ATR_FS_STARTED
+        or gAtr_QuickRefreshAwaitingResponse
+    ) then
+        return false;
+    end
+
+    local entry = Atr_QuickRefreshCurrentEntry();
+
+    if (not entry) then
+        return false;
+    end
+
+    if (not CanSendAuctionQuery()) then
+        return false;
+    end
+
+    if (BrowseName) then
+        BrowseName:SetText (entry.name);
+    end
+
+    gAtr_QuickRefreshAwaitingResponse = true;
+    gAtr_QuickRefreshQuerySentAt = GetTime();
+    gAtr_QuickRefreshStaleStartedAt = nil;
+
+    QueryAuctionItems (
+        zc.UTF8_Truncate (entry.name, 63),
+        nil,
+        nil,
+        nil,
+        entry.itemClass or 0,
+        entry.itemSubclass or 0,
+        gAtr_QuickRefreshPage,
+        nil,
+        nil
+    );
+
+    return true;
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshFinishAll ()
+
+    local elapsed = 0;
+
+    if (gAtr_QuickRefreshStartedAt) then
+        elapsed = GetTime() - gAtr_QuickRefreshStartedAt;
+    end
+
+    local total = #gAtr_QuickRefreshQueue;
+    local elapsedText =
+        Atr_FullScanFormatRemaining (elapsed);
+
+    gAtr_QuickRefreshActive = false;
+    gAtr_FullScanState = ATR_FS_NULL;
+    gAtr_FullScanSubState = ATR_FSS_NULL;
+    gAtr_QuickRefreshAwaitingResponse = false;
+    gAtr_QuickRefreshQuerySentAt = nil;
+    gAtr_QuickRefreshStaleStartedAt = nil;
+
+    if (Atr_FullScanDone) then
+        Atr_FullScanDone:Enable();
+    end
+
+    Atr_UpdateFullScanFrame();
+
+    local normalItemCount =
+        math.max (
+            0,
+            total - gAtr_QuickRefreshDEMaterialCount
+        );
+
+    Atr_FullScanStatus:SetText (
+        string.format (
+            "Quick Refresh complete\n%d queried + %d fresh in %s\n%d DE mats | Added %d | Changed %d | No AH %d",
+            total,
+            gAtr_QuickRefreshFreshSkipped,
+            elapsedText,
+            gAtr_QuickRefreshDEMaterialCount,
+            gAtr_QuickRefreshAdded,
+            gAtr_QuickRefreshUpdated,
+            gAtr_QuickRefreshNoAuctions
+        )
+    );
+
+    zc.msg_atr (
+        string.format (
+            "Quick Refresh complete: %d queries sent, %d recently checked prices reused, %d DE materials queried; %d added, %d changed, %d unchanged, %d with no current auctions.",
+            total,
+            gAtr_QuickRefreshFreshSkipped,
+            gAtr_QuickRefreshDEMaterialCount,
+            gAtr_QuickRefreshAdded,
+            gAtr_QuickRefreshUpdated,
+            gAtr_QuickRefreshUnchanged,
+            gAtr_QuickRefreshNoAuctions
+        )
+    );
+
+    collectgarbage ("collect");
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshStop (reason)
+
+    gAtr_QuickRefreshActive = false;
+    gAtr_FullScanState = ATR_FS_NULL;
+    gAtr_FullScanSubState = ATR_FSS_NULL;
+    gAtr_QuickRefreshAwaitingResponse = false;
+    gAtr_QuickRefreshQuerySentAt = nil;
+    gAtr_QuickRefreshStaleStartedAt = nil;
+
+    if (Atr_FullScanDone) then
+        Atr_FullScanDone:Enable();
+    end
+
+    Atr_UpdateFullScanFrame();
+
+    if (reason and Atr_FullScanStatus) then
+        Atr_FullScanStatus:SetText (reason);
+        zc.msg_atr (reason);
+    end
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshFinishItem ()
+
+    local entry = Atr_QuickRefreshCurrentEntry();
+
+    if (not entry) then
+        Atr_QuickRefreshFinishAll();
+        return;
+    end
+
+    local oldPrice = gAtr_ScanDB[entry.name];
+    local newPrice =
+        Atr_CalcNewDBprice (
+            entry.name,
+            gAtr_QuickRefreshLowprices
+        );
+
+    local quality =
+        gAtr_QuickRefreshQuality;
+
+    if (quality == nil) then
+        quality = entry.quality;
+    end
+
+    local forceInclude =
+        entry.source == "disenchant-material";
+
+    if (
+        newPrice > 0
+        and quality ~= nil
+        and (
+            forceInclude
+            or quality + 1 >= AUCTIONATOR_SCAN_MINLEVEL
+        )
+    ) then
+
+        gAtr_ScanDB[entry.name] = newPrice;
+
+        if (oldPrice == nil) then
+            gAtr_QuickRefreshAdded =
+                gAtr_QuickRefreshAdded + 1;
+
+        elseif (oldPrice ~= newPrice) then
+            gAtr_QuickRefreshUpdated =
+                gAtr_QuickRefreshUpdated + 1;
+
+        else
+            gAtr_QuickRefreshUnchanged =
+                gAtr_QuickRefreshUnchanged + 1;
+        end
+
+        Atr_MarketMetaMarkSeen (
+            entry.name,
+            newPrice,
+            "quick"
+        );
+
+    elseif (newPrice <= 0) then
+
+        -- Keep Auctionator's last known database value. The metadata
+        -- records that the item was checked and had no current buyout,
+        -- so future UI work can distinguish fresh from stale values.
+        gAtr_QuickRefreshNoAuctions =
+            gAtr_QuickRefreshNoAuctions + 1;
+
+        Atr_MarketMetaMarkMissing (
+            entry.name,
+            "quick"
+        );
+
+    else
+
+        gAtr_QuickRefreshSkipped =
+            gAtr_QuickRefreshSkipped + 1;
+    end
+
+    if (gAtr_QuickRefreshItemStartedAt) then
+
+        local duration =
+            math.max (
+                0.01,
+                GetTime() - gAtr_QuickRefreshItemStartedAt
+            );
+
+        table.insert (
+            gAtr_QuickRefreshDurations,
+            duration
+        );
+
+        while (
+            #gAtr_QuickRefreshDurations
+            > ATR_QUICK_ETA_SAMPLE_COUNT
+        ) do
+            table.remove (
+                gAtr_QuickRefreshDurations,
+                1
+            );
+        end
+    end
+
+    gAtr_QuickRefreshIndex =
+        gAtr_QuickRefreshIndex + 1;
+
+    if (
+        gAtr_QuickRefreshIndex
+        > #gAtr_QuickRefreshQueue
+    ) then
+        Atr_QuickRefreshFinishAll();
+        return;
+    end
+
+    Atr_QuickRefreshResetItem();
+    Atr_QuickRefreshUpdateStatus();
+    Atr_QuickRefreshSendPage();
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshAcceptPage (
+    numBatchAuctions,
+    totalAuctions
+)
+
+    local entry = Atr_QuickRefreshCurrentEntry();
+
+    if (not entry) then
+        Atr_QuickRefreshFinishAll();
+        return;
+    end
+
+    local x;
+
+    for x = 1, numBatchAuctions do
+
+        local name, texture, count, quality, canUse, level,
+            minBid, minIncrement, buyoutPrice =
+            GetAuctionItemInfo ("list", x);
+
+        if (
+            name
+            and Atr_QuickRefreshNamesSame (
+                name,
+                entry.name
+            )
+            and count
+            and count > 0
+            and buyoutPrice
+            and buyoutPrice > 0
+        ) then
+
+            local itemPrice =
+                math.floor (buyoutPrice / count);
+
+            if (itemPrice > 0) then
+
+                Atr_AddToLowPrices (
+                    gAtr_QuickRefreshLowprices,
+                    itemPrice
+                );
+
+                if (quality ~= nil) then
+                    gAtr_QuickRefreshQuality = quality;
+                end
+            end
+        end
+    end
+
+    gAtr_QuickRefreshRetries = 0;
+    gAtr_QuickRefreshStaleStartedAt = nil;
+    gAtr_QuickRefreshAwaitingResponse = false;
+
+    local totalPages = 0;
+
+    if (totalAuctions and totalAuctions > 0) then
+        totalPages = math.ceil (
+            totalAuctions / ATR_FULLSCAN_PAGE_SIZE
+        );
+    end
+
+    local pageNumber =
+        gAtr_QuickRefreshPage + 1;
+
+    local done =
+        numBatchAuctions < ATR_FULLSCAN_PAGE_SIZE;
+
+    if (
+        not done
+        and totalPages > 0
+        and pageNumber >= totalPages
+    ) then
+        done = true;
+    end
+
+    if (done) then
+        Atr_QuickRefreshFinishItem();
+        return;
+    end
+
+    gAtr_QuickRefreshPage =
+        gAtr_QuickRefreshPage + 1;
+
+    Atr_QuickRefreshUpdateStatus();
+    Atr_QuickRefreshSendPage();
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshAnalyze ()
+
+    if (
+        not gAtr_QuickRefreshActive
+        or not gAtr_QuickRefreshAwaitingResponse
+    ) then
+        return;
+    end
+
+    local numBatchAuctions, totalAuctions =
+        GetNumAuctionItems ("list");
+
+    if (
+        numBatchAuctions == nil
+        or totalAuctions == nil
+    ) then
+        return;
+    end
+
+    -- A genuine empty result is valid for Quick Refresh. It means
+    -- there are currently no auctions for this item.
+    if (
+        numBatchAuctions == 0
+        and totalAuctions == 0
+    ) then
+
+        gAtr_QuickRefreshLastSignature = "empty";
+
+        Atr_QuickRefreshAcceptPage (
+            numBatchAuctions,
+            totalAuctions
+        );
+
+        return;
+    end
+
+    local signature =
+        Atr_QuickRefreshPageSignature (
+            numBatchAuctions
+        );
+
+    if (
+        gAtr_QuickRefreshLastSignature ~= nil
+        and gAtr_QuickRefreshLastSignature ~= "empty"
+        and signature == gAtr_QuickRefreshLastSignature
+    ) then
+
+        if (not gAtr_QuickRefreshStaleStartedAt) then
+            gAtr_QuickRefreshStaleStartedAt = GetTime();
+        end
+
+        return;
+    end
+
+    gAtr_QuickRefreshLastSignature = signature;
+
+    Atr_QuickRefreshAcceptPage (
+        numBatchAuctions,
+        totalAuctions
+    );
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshFrameIdle ()
+
+    if (not gAtr_QuickRefreshActive) then
+        return;
+    end
+
+    if (
+        gAtr_QuickRefreshAwaitingResponse
+        and gAtr_QuickRefreshStaleStartedAt
+    ) then
+
+        local numBatchAuctions, totalAuctions =
+            GetNumAuctionItems ("list");
+
+        if (
+            numBatchAuctions ~= nil
+            and totalAuctions ~= nil
+        ) then
+
+            if (
+                numBatchAuctions == 0
+                and totalAuctions == 0
+            ) then
+
+                gAtr_QuickRefreshLastSignature = "empty";
+
+                Atr_QuickRefreshAcceptPage (
+                    numBatchAuctions,
+                    totalAuctions
+                );
+
+                return;
+            end
+
+            local signature =
+                Atr_QuickRefreshPageSignature (
+                    numBatchAuctions
+                );
+
+            if (
+                signature
+                ~= gAtr_QuickRefreshLastSignature
+            ) then
+
+                gAtr_QuickRefreshLastSignature =
+                    signature;
+
+                Atr_QuickRefreshAcceptPage (
+                    numBatchAuctions,
+                    totalAuctions
+                );
+
+                return;
+            end
+        end
+
+        if (
+            GetTime() - gAtr_QuickRefreshStaleStartedAt
+            >= ATR_QUICK_STALE_POLL_TIMEOUT
+        ) then
+
+            gAtr_QuickRefreshRetries =
+                gAtr_QuickRefreshRetries + 1;
+
+            if (
+                gAtr_QuickRefreshRetries
+                > ATR_QUICK_MAX_RETRIES
+            ) then
+
+                Atr_QuickRefreshStop (
+                    "Quick Refresh stopped: repeated stale AH responses."
+                );
+
+                return;
+            end
+
+            gAtr_QuickRefreshAwaitingResponse = false;
+            gAtr_QuickRefreshStaleStartedAt = nil;
+            gAtr_QuickRefreshQuerySentAt = nil;
+
+            Atr_QuickRefreshSendPage();
+            return;
+        end
+
+    elseif (
+        gAtr_QuickRefreshAwaitingResponse
+        and gAtr_QuickRefreshQuerySentAt
+        and GetTime() - gAtr_QuickRefreshQuerySentAt
+            >= ATR_QUICK_RESPONSE_TIMEOUT
+    ) then
+
+        gAtr_QuickRefreshRetries =
+            gAtr_QuickRefreshRetries + 1;
+
+        if (
+            gAtr_QuickRefreshRetries
+            > ATR_QUICK_MAX_RETRIES
+        ) then
+
+            Atr_QuickRefreshStop (
+                "Quick Refresh stopped: Warmane stopped responding to AH queries."
+            );
+
+            return;
+        end
+
+        gAtr_QuickRefreshAwaitingResponse = false;
+        gAtr_QuickRefreshQuerySentAt = nil;
+
+        Atr_QuickRefreshSendPage();
+        return;
+
+    elseif (not gAtr_QuickRefreshAwaitingResponse) then
+
+        Atr_QuickRefreshSendPage();
+    end
+end
+
+-----------------------------------------
+-- Scrollable Full Scan help
+-----------------------------------------
+
+local function Atr_FullScanEnsureHelpScroll ()
+
+    local existing =
+        _G["Atr_FullScanHelpScroll"];
+
+    if (existing) then
+        return existing;
+    end
+
+    local scroll = CreateFrame (
+        "ScrollFrame",
+        "Atr_FullScanHelpScroll",
+        Atr_FullScanFrame,
+        "UIPanelScrollFrameTemplate"
+    );
+
+    scroll:SetPoint (
+        "TOPLEFT",
+        Atr_FullScanFrame,
+        "TOPLEFT",
+        27,
+        -220
+    );
+
+    scroll:SetWidth (385);
+    scroll:SetHeight (175);
+
+    local child = CreateFrame (
+        "Frame",
+        "Atr_FullScanHelpScrollChild",
+        scroll
+    );
+
+    child:SetWidth (355);
+    child:SetHeight (175);
+
+    scroll:SetScrollChild (child);
+
+    local helpText = child:CreateFontString (
+        "Atr_FullScanHelpText",
+        "ARTWORK",
+        "GameFontLightGraySmall"
+    );
+
+    helpText:SetPoint (
+        "TOPLEFT",
+        child,
+        "TOPLEFT",
+        0,
+        0
+    );
+
+    helpText:SetWidth (355);
+    helpText:SetJustifyH ("LEFT");
+    helpText:SetJustifyV ("TOP");
+
+    scroll:EnableMouseWheel (true);
+
+    scroll:SetScript (
+        "OnMouseWheel",
+        function (self, delta)
+
+            local current =
+                self:GetVerticalScroll() or 0;
+
+            local maximum =
+                self:GetVerticalScrollRange() or 0;
+
+            local nextScroll =
+                current - (delta * 30);
+
+            if (nextScroll < 0) then
+                nextScroll = 0;
+            elseif (nextScroll > maximum) then
+                nextScroll = maximum;
+            end
+
+            self:SetVerticalScroll (
+                nextScroll
+            );
+        end
+    );
+
+    return scroll;
+end
+
+-----------------------------------------
+
+local function Atr_FullScanUpdateHelpText ()
+
+    local scroll =
+        Atr_FullScanEnsureHelpScroll();
+
+    local child =
+        _G["Atr_FullScanHelpScrollChild"];
+
+    local helpText =
+        _G["Atr_FullScanHelpText"];
+
+    if (
+        not scroll
+        or not child
+        or not helpText
+    ) then
+        return;
+    end
+
+    local help =
+        "Full Scan scans the entire Auction House and builds Auctionator's broad price database."
+        .. "\n\n"
+        .. "If a Full Scan is interrupted, its progress is saved. Resume Scan continues from the saved page instead of starting again."
+        .. "\n\n"
+        .. "Quick Refresh updates exact items from your bags, cached bank contents, shopping lists and Recent Searches. It only adds disenchant materials relevant to that equipment, and prices checked within the last 15 minutes are reused instead of querying Warmane again. It can be used while a Full Scan is paused without deleting the saved Full Scan progress."
+        .. "\n\n"
+        .. "Clear DB removes the current realm/faction scan price database so you can rebuild only the items you care about with Quick Refresh. It also discards any saved Resume Scan checkpoint."
+        .. "\n\n"
+        .. "Open your bank once to refresh the bank cache. Shift-click Resume Scan if you intentionally want to discard the saved Full Scan and start over.";
+
+    helpText:SetText (help);
+
+    local textHeight =
+        helpText:GetStringHeight() or 0;
+
+    child:SetHeight (
+        math.max (
+            175,
+            textHeight + 12
+        )
+    );
+
+    scroll:SetVerticalScroll (0);
+end
+
+-----------------------------------------
+-- Clear price database
+-----------------------------------------
+
+local function Atr_ClearDatabaseTable (db)
+
+    if (type(db) ~= "table") then
+        return;
+    end
+
+    local key;
+
+    for key in pairs (db) do
+        db[key] = nil;
+    end
+end
+
+-----------------------------------------
+
+local function Atr_ClearDatabaseCurrentScopeMetadata ()
+
+    if (type(AUCTIONATOR_SAVEDVARS) ~= "table") then
+        return;
+    end
+
+    local root =
+        AUCTIONATOR_SAVEDVARS[ATR_MARKET_META_KEY];
+
+    if (
+        type(root) == "table"
+        and type(root.scopes) == "table"
+    ) then
+
+        root.scopes[
+            Atr_MarketMetaGetScopeKey()
+        ] = nil;
+    end
+end
+
+-----------------------------------------
+
+local function Atr_ClearDatabaseNow ()
+
+    -- Never allow a destructive clear while an AH query sequence is
+    -- actively running.
+    if (
+        gAtr_FullScanState ~= ATR_FS_NULL
+        or gAtr_QuickRefreshActive
+    ) then
+
+        Atr_FullScanStatus:SetText (
+            "Wait for the current scan to finish or pause it before clearing the database."
+        );
+
+        return;
+    end
+
+    -- Clear the current realm/faction price tables in-place so the
+    -- existing gAtr_ScanDB / gAtr_MeanDB references remain valid.
+    Atr_ClearDatabaseTable (gAtr_ScanDB);
+    Atr_ClearDatabaseTable (gAtr_MeanDB);
+
+    -- Remove metadata that belongs to the cleared price database.
+    Atr_ClearDatabaseCurrentScopeMetadata();
+
+    -- A saved Full Scan contains prices gathered before this clear.
+    -- Discard it as well, otherwise Resume Scan could repopulate old
+    -- partial data immediately after the user intentionally cleared it.
+    Atr_FullScanClearCheckpoint();
+
+    -- Clear any in-memory scan objects that may still contain prices
+    -- from before the database reset.
+    if (Atr_ClearScanCache) then
+        Atr_ClearScanCache();
+    end
+
+    Atr_FullScanResetRuntime();
+
+    gAtr_FullScanStart = nil;
+    gAtr_FullScanDur = nil;
+    AUCTIONATOR_LAST_SCAN_TIME = nil;
+
+    if (Atr_FullScanResults) then
+        Atr_FullScanResults:Hide();
+    end
+
+    if (Atr_FullScanHTML) then
+        Atr_FullScanHTML:Hide();
+    end
+
+    local helpScroll =
+        Atr_FullScanEnsureHelpScroll();
+
+    Atr_FullScanUpdateHelpText();
+    helpScroll:Show();
+
+    Atr_UpdateFullScanFrame();
+
+    if (Atr_FullScanStatus) then
+
+        Atr_FullScanStatus:SetText (
+            "Database cleared\n0 items in price database\nUse Quick Refresh or Start Scanning"
+        );
+
+    end
+
+    zc.msg_atr (
+        "Auctionator scan database cleared for this realm/faction. Shopping lists, Recent Searches and the bank cache were kept."
+    );
+
+    collectgarbage ("collect");
+end
+
+-----------------------------------------
+
+local function Atr_ClearDatabaseShowConfirm ()
+
+    if (
+        gAtr_FullScanState ~= ATR_FS_NULL
+        or gAtr_QuickRefreshActive
+    ) then
+
+        Atr_FullScanStatus:SetText (
+            "Wait for the current scan to finish or pause it before clearing the database."
+        );
+
+        return;
+    end
+
+    if (not StaticPopupDialogs["ATR_CLEAR_SCAN_DATABASE"]) then
+
+        StaticPopupDialogs["ATR_CLEAR_SCAN_DATABASE"] = {
+            text = "",
+            button1 = YES,
+            button2 = NO,
+
+            OnAccept = function ()
+                Atr_ClearDatabaseNow();
+            end,
+
+            timeout = 0,
+            whileDead = 1,
+            hideOnEscape = 1
+        };
+    end
+
+    local warning =
+        "Clear Auctionator's scan price database for this realm/faction?\n\n"
+        .. "This clears Full Scan / Quick Refresh price data and mean-price data. "
+        .. "Shopping lists, Recent Searches, normal pricing history and the cached bank list are kept.";
+
+    if (Atr_FullScanGetCheckpoint()) then
+
+        warning = warning
+            .. "\n\nThe saved Resume Scan checkpoint will also be discarded.";
+
+    end
+
+    StaticPopupDialogs[
+        "ATR_CLEAR_SCAN_DATABASE"
+    ].text = warning;
+
+    StaticPopup_Show (
+        "ATR_CLEAR_SCAN_DATABASE"
+    );
+end
+
+-----------------------------------------
+
+local function Atr_ClearDatabaseEnsureButton ()
+
+    if (_G["Atr_ClearDatabaseButton"]) then
+        return _G["Atr_ClearDatabaseButton"];
+    end
+
+    local button = CreateFrame (
+        "Button",
+        "Atr_ClearDatabaseButton",
+        Atr_FullScanFrame,
+        "UIPanelButtonTemplate"
+    );
+
+    button:SetWidth (80);
+    button:SetHeight (22);
+    button:SetPoint (
+        "TOPRIGHT",
+        Atr_FullScanFrame,
+        "TOPRIGHT",
+        -30,
+        -185
+    );
+    button:SetText ("Clear DB");
+
+    button:SetScript (
+        "OnClick",
+        function ()
+            Atr_ClearDatabaseShowConfirm();
+        end
+    );
+
+    button:SetScript (
+        "OnEnter",
+        function (self)
+
+            GameTooltip:SetOwner (self, "ANCHOR_RIGHT");
+            GameTooltip:SetText ("Clear Database");
+
+            GameTooltip:AddLine (
+                "Clears Auctionator's scan price database and mean-price database for this realm/faction.",
+                1,
+                1,
+                1,
+                true
+            );
+
+            GameTooltip:AddLine (
+                "Shopping lists, Recent Searches, normal pricing history and the cached bank list are kept.",
+                0.75,
+                0.75,
+                0.75,
+                true
+            );
+
+            if (Atr_FullScanGetCheckpoint()) then
+
+                GameTooltip:AddLine (
+                    "The saved Resume Scan checkpoint will also be discarded.",
+                    1,
+                    0.35,
+                    0.35,
+                    true
+                );
+
+            end
+
+            GameTooltip:Show();
+        end
+    );
+
+    button:SetScript (
+        "OnLeave",
+        function ()
+            GameTooltip:Hide();
+        end
+    );
+
+    return button;
+end
+
+-----------------------------------------
+
+local function Atr_QuickRefreshEnsureButton ()
+
+    if (_G["Atr_QuickRefreshButton"]) then
+        return _G["Atr_QuickRefreshButton"];
+    end
+
+    local button = CreateFrame (
+        "Button",
+        "Atr_QuickRefreshButton",
+        Atr_FullScanFrame,
+        "UIPanelButtonTemplate"
+    );
+
+    button:SetWidth (120);
+    button:SetHeight (22);
+    button:SetPoint (
+        "TOPRIGHT",
+        Atr_FullScanFrame,
+        "TOPRIGHT",
+        -114,
+        -185
+    );
+    button:SetText ("Quick Refresh");
+
+    button:SetScript (
+        "OnClick",
+        function ()
+            Atr_QuickRefreshStart();
+        end
+    );
+
+    button:SetScript (
+        "OnEnter",
+        function (self)
+
+            GameTooltip:SetOwner (self, "ANCHOR_RIGHT");
+            GameTooltip:SetText ("Quick Refresh");
+            GameTooltip:AddLine (
+                "Refreshes exact items from bags, cached bank contents, shopping lists and Recent Searches. Only relevant disenchant materials are added, and prices checked within 15 minutes are reused without another AH query.",
+                1,
+                1,
+                1,
+                true
+            );
+
+            if (Atr_FullScanGetCheckpoint()) then
+
+                GameTooltip:AddLine (
+                    "A paused Full Scan is saved. Quick Refresh will not discard or advance that checkpoint.",
+                    0.35,
+                    1,
+                    0.35,
+                    true
+                );
+
+            end
+
+            local bankCache =
+                Atr_QuickRefreshGetBankCache();
+
+            if (
+                bankCache
+                and bankCache.updatedAt
+                and type(bankCache.items) == "table"
+            ) then
+
+                local age =
+                    math.max (
+                        0,
+                        time() - bankCache.updatedAt
+                    );
+
+                GameTooltip:AddLine (
+                    string.format (
+                        "Bank cache: %d items, captured %s ago.",
+                        #bankCache.items,
+                        Atr_FullScanFormatRemaining (age)
+                    ),
+                    0.75,
+                    0.75,
+                    0.75,
+                    true
+                );
+
+            else
+
+                GameTooltip:AddLine (
+                    "Bank cache: not captured yet. Open your bank once to populate it.",
+                    0.75,
+                    0.75,
+                    0.75,
+                    true
+                );
+            end
+
+            GameTooltip:Show();
+        end
+    );
+
+    button:SetScript (
+        "OnLeave",
+        function ()
+            GameTooltip:Hide();
+        end
+    );
+
+    return button;
+end
+
+-----------------------------------------
+
+function Atr_QuickRefreshStart ()
+
+    if (gAtr_FullScanState ~= ATR_FS_NULL) then
+        return;
+    end
+
+    if (
+        gCurrentPane
+        and gCurrentPane.activeSearch
+        and gCurrentPane.activeSearch.processing_state
+        and gCurrentPane.activeSearch.processing_state
+            ~= KM_NULL_STATE
+    ) then
+
+        Atr_FullScanStatus:SetText (
+            "Please wait for the current Auctionator search to finish."
+        );
+
+        return;
+    end
+
+    if (not CanSendAuctionQuery()) then
+
+        Atr_FullScanStatus:SetText (
+            "Waiting for auction query..."
+        );
+
+        return;
+    end
+
+    gAtr_QuickRefreshDEMaterialCount = 0;
+    gAtr_QuickRefreshFreshSkipped = 0;
+    gAtr_QuickRefreshCandidateCount = 0;
+
+    gAtr_QuickRefreshQueue =
+        Atr_QuickRefreshBuildQueue();
+
+    if (#gAtr_QuickRefreshQueue == 0) then
+
+        if (gAtr_QuickRefreshFreshSkipped > 0) then
+
+            Atr_FullScanStatus:SetText (
+                string.format (
+                    "Quick Refresh complete\n%d prices are still fresh\nNo Warmane queries needed",
+                    gAtr_QuickRefreshFreshSkipped
+                )
+            );
+
+            zc.msg_atr (
+                string.format (
+                    "Quick Refresh: %d items were checked recently enough to reuse; no Auction House queries were needed.",
+                    gAtr_QuickRefreshFreshSkipped
+                )
+            );
+
+        else
+
+            Atr_FullScanStatus:SetText (
+                "Quick Refresh found no exact auctionable items in bags, bank cache or lists."
+            );
+
+        end
+
+        return;
+    end
+
+    gAtr_QuickRefreshActive = true;
+    gAtr_QuickRefreshIndex = 1;
+    gAtr_QuickRefreshLastSignature = nil;
+    gAtr_QuickRefreshStartedAt = GetTime();
+    gAtr_QuickRefreshDurations = {};
+    gAtr_QuickRefreshUpdated = 0;
+    gAtr_QuickRefreshAdded = 0;
+    gAtr_QuickRefreshUnchanged = 0;
+    gAtr_QuickRefreshNoAuctions = 0;
+    gAtr_QuickRefreshSkipped = 0;
+
+    gAtr_FullScanState = ATR_FS_STARTED;
+    gAtr_FullScanSubState = ATR_FSS_WAITING_PAGE;
+
+    SortAuctionClearSort ("list");
+
+    if (Atr_FullScanStartButton) then
+        Atr_FullScanStartButton:Disable();
+    end
+
+    if (Atr_FullScanDone) then
+        Atr_FullScanDone:Disable();
+    end
+
+    local button = Atr_QuickRefreshEnsureButton();
+    button:Disable();
+
+    if (_G["Atr_ClearDatabaseButton"]) then
+        _G["Atr_ClearDatabaseButton"]:Disable();
+    end
+
+    Atr_QuickRefreshResetItem();
+    Atr_QuickRefreshUpdateStatus();
+    Atr_QuickRefreshSendPage();
 end
 
 -----------------------------------------
@@ -1894,6 +4067,14 @@ function Atr_FullScanStart()
     Atr_FullScanStartButton:Disable();
     Atr_FullScanDone:Disable();
 
+    if (_G["Atr_QuickRefreshButton"]) then
+        _G["Atr_QuickRefreshButton"]:Disable();
+    end
+
+    if (_G["Atr_ClearDatabaseButton"]) then
+        _G["Atr_ClearDatabaseButton"]:Disable();
+    end
+
     SortAuctionClearSort ("list");
 
     if (checkpoint) then
@@ -2119,6 +4300,19 @@ local function Atr_FullScanFinalize ()
     );
 
     Atr_FullScanHTML:Hide();
+
+    if (_G["Atr_FullScanHelpScroll"]) then
+        _G["Atr_FullScanHelpScroll"]:Hide();
+    end
+
+    if (_G["Atr_QuickRefreshButton"]) then
+        _G["Atr_QuickRefreshButton"]:Hide();
+    end
+
+    if (_G["Atr_ClearDatabaseButton"]) then
+        _G["Atr_ClearDatabaseButton"]:Hide();
+    end
+
     Atr_FullScanResults:Show();
 
     Atr_FullScanResults:SetBackdropColor (
@@ -2128,6 +4322,10 @@ local function Atr_FullScanFinalize ()
     );
 
     AUCTIONATOR_LAST_SCAN_TIME = time();
+
+    -- Record which old DB entries were not seen anywhere in this
+    -- complete scan. Keep their historical price, but mark it stale.
+    Atr_MarketMetaMarkFullScanStale();
 
     Atr_FullScanClearCheckpoint();
 
@@ -2222,6 +4420,12 @@ local function Atr_FullScanProcessDatabaseChunk ()
                     end
 
                     gAtr_ScanDB[name] = newprice;
+
+                    Atr_MarketMetaMarkSeen (
+                        name,
+                        newprice,
+                        "full"
+                    );
 
                     if (gAtr_MeanDB[name] == nil) then
                         gAtr_MeanDB[name] = {};
@@ -2436,6 +4640,14 @@ end
 
 function Atr_FullScanAnalyze()
 
+    -- Auctionator.lua already routes AUCTION_ITEM_LIST_UPDATE here
+    -- while gAtr_FullScanState == ATR_FS_STARTED. Reuse that route
+    -- for Quick Refresh so no other addon file needs modifying.
+    if (gAtr_QuickRefreshActive) then
+        Atr_QuickRefreshAnalyze();
+        return;
+    end
+
     if (
         gAtr_FullScanState
         ~= ATR_FS_STARTED
@@ -2523,10 +4735,580 @@ function Atr_FullScanAnalyze()
 end
 
 -----------------------------------------
+-- Recommended sell price helpers
+-----------------------------------------
+
+local gAtr_RecommendedSellHooksInstalled = false;
+
+local function Atr_GetRecommendedSellPrice (item)
+
+    local itemName =
+        GetItemInfo (item);
+
+    if (not itemName) then
+        return nil;
+    end
+
+    local marketPrice =
+        gAtr_ScanDB
+        and gAtr_ScanDB[itemName]
+        or nil;
+
+    if (
+        type(marketPrice) ~= "number"
+        or marketPrice <= 0
+    ) then
+        return nil;
+    end
+
+    local recommended =
+        marketPrice;
+
+    if (Atr_CalcUndercutPrice) then
+
+        local ok, value =
+            pcall (
+                Atr_CalcUndercutPrice,
+                marketPrice
+            );
+
+        if (
+            ok
+            and type(value) == "number"
+            and value > 0
+        ) then
+            recommended = value;
+        end
+    end
+
+    return math.floor (
+        recommended + 0.5
+    );
+end
+
+-----------------------------------------
+
+local function Atr_RecommendedSellItemCanAuction (link)
+
+    if (not link) then
+        return false;
+    end
+
+    local itemID;
+
+    if (
+        zc
+        and zc.ItemIDfromLink
+    ) then
+
+        -- ItemIDfromLink can return more than one value in this old
+        -- Auctionator utility. Passing the call directly into tonumber()
+        -- forwards those extra return values, making Lua treat the
+        -- second one as tonumber's optional numeric base.
+        --
+        -- Store the first return value explicitly before converting it.
+        local rawItemID =
+            zc.ItemIDfromLink (link);
+
+        itemID =
+            tonumber (rawItemID);
+    end
+
+    if (
+        itemID
+        and Atr_GetBonding
+    ) then
+
+        local ok, bonding =
+            pcall (
+                Atr_GetBonding,
+                itemID
+            );
+
+        if (ok) then
+
+            -- 1 = Bind on Pickup.
+            -- 4 / 5 are quest-item binding states in the old
+            -- Auctionator tooltip code.
+            if (
+                bonding == 1
+                or bonding == 4
+                or bonding == 5
+            ) then
+                return false;
+            end
+        end
+    end
+
+    return true;
+end
+
+-----------------------------------------
+
+local function Atr_AppendRecommendedSellToTooltip (
+    tip,
+    link,
+    count
+)
+
+    if (
+        not tip
+        or not link
+        or AUCTIONATOR_A_TIPS ~= 1
+        or not Atr_RecommendedSellItemCanAuction (link)
+    ) then
+        return;
+    end
+
+    local recommended =
+        Atr_GetRecommendedSellPrice (link);
+
+    if (
+        not recommended
+        or recommended <= 0
+    ) then
+        return;
+    end
+
+    local xstring = "";
+    local displayPrice = recommended;
+    local showStackPrices = IsShiftKeyDown();
+
+    if (AUCTIONATOR_SHIFT_TIPS == 2) then
+        showStackPrices = not IsShiftKeyDown();
+    end
+
+    if (
+        count
+        and count > 1
+        and showStackPrices
+    ) then
+
+        displayPrice =
+            displayPrice * count;
+
+        xstring =
+            "|cFFAAAAFF x"
+            .. tostring(count)
+            .. "|r";
+    end
+
+    tip:AddDoubleLine (
+        "Recommended sell" .. xstring,
+        "|cFFFFFFFF"
+            .. zc.priceToMoneyString (
+                displayPrice
+            )
+    );
+
+    tip:Show();
+end
+
+-----------------------------------------
+
+local function Atr_InstallRecommendedSellTooltipHooks ()
+
+    if (
+        gAtr_RecommendedSellHooksInstalled
+        or not hooksecurefunc
+        or not GameTooltip
+    ) then
+        return;
+    end
+
+    gAtr_RecommendedSellHooksInstalled = true;
+
+    -- Register these AFTER AuctionatorHints.lua has loaded so the
+    -- recommended sell line appears underneath Auctionator's existing
+    -- Auction / Disenchant values.
+    hooksecurefunc (
+        GameTooltip,
+        "SetBagItem",
+        function (tip, bag, slot)
+
+            local _, count =
+                GetContainerItemInfo (
+                    bag,
+                    slot
+                );
+
+            Atr_AppendRecommendedSellToTooltip (
+                tip,
+                GetContainerItemLink (
+                    bag,
+                    slot
+                ),
+                count
+            );
+        end
+    );
+
+    hooksecurefunc (
+        GameTooltip,
+        "SetAuctionItem",
+        function (tip, listType, index)
+
+            local _, _, count =
+                GetAuctionItemInfo (
+                    listType,
+                    index
+                );
+
+            Atr_AppendRecommendedSellToTooltip (
+                tip,
+                GetAuctionItemLink (
+                    listType,
+                    index
+                ),
+                count
+            );
+        end
+    );
+
+    hooksecurefunc (
+        GameTooltip,
+        "SetAuctionSellItem",
+        function (tip)
+
+            local name, _, count =
+                GetAuctionSellItemInfo();
+
+            local _, link =
+                GetItemInfo (name);
+
+            Atr_AppendRecommendedSellToTooltip (
+                tip,
+                link,
+                count
+            );
+        end
+    );
+
+    hooksecurefunc (
+        GameTooltip,
+        "SetInventoryItem",
+        function (tip, unit, slot)
+
+            Atr_AppendRecommendedSellToTooltip (
+                tip,
+                GetInventoryItemLink (
+                    unit,
+                    slot
+                ),
+                GetInventoryItemCount (
+                    unit,
+                    slot
+                )
+            );
+        end
+    );
+
+    if (GameTooltip.SetGuildBankItem) then
+
+        hooksecurefunc (
+            GameTooltip,
+            "SetGuildBankItem",
+            function (tip, tab, slot)
+
+                local link =
+                    GetGuildBankItemLink
+                    and GetGuildBankItemLink (
+                        tab,
+                        slot
+                    )
+                    or nil;
+
+                local _, count;
+
+                if (GetGuildBankItemInfo) then
+                    _, count =
+                        GetGuildBankItemInfo (
+                            tab,
+                            slot
+                        );
+                end
+
+                Atr_AppendRecommendedSellToTooltip (
+                    tip,
+                    link,
+                    count
+                );
+            end
+        );
+    end
+end
+
+-----------------------------------------
+-- Sell-pane database prefill
+-----------------------------------------
+
+local function Atr_PrefillSellPriceFromDatabase ()
+
+    if (
+        not Atr_IsModeCreateAuction
+        or not Atr_IsModeCreateAuction()
+        or not GetAuctionSellItemInfo
+    ) then
+        return;
+    end
+
+    local itemName, texture, count =
+        GetAuctionSellItemInfo();
+
+    if (
+        not itemName
+        or not count
+        or count <= 0
+    ) then
+        return;
+    end
+
+    local recommended =
+        Atr_GetRecommendedSellPrice (
+            itemName
+        );
+
+    if (
+        not recommended
+        or recommended <= 0
+    ) then
+        return;
+    end
+
+    local stackSize = count;
+
+    if (Atr_StackSize) then
+
+        local current =
+            tonumber (
+                Atr_StackSize()
+            );
+
+        if (
+            current
+            and current > 0
+        ) then
+            stackSize = current;
+        end
+    end
+
+    local stackPrice =
+        recommended * stackSize;
+
+    if (
+        Atr_ItemPrice
+        and MoneyInputFrame_SetCopper
+    ) then
+
+        MoneyInputFrame_SetCopper (
+            Atr_ItemPrice,
+            recommended
+        );
+    end
+
+    if (
+        Atr_StackPrice
+        and MoneyInputFrame_SetCopper
+    ) then
+
+        MoneyInputFrame_SetCopper (
+            Atr_StackPrice,
+            stackPrice
+        );
+    end
+
+    if (
+        Atr_StartingPrice
+        and MoneyInputFrame_SetCopper
+    ) then
+
+        local startPrice =
+            recommended;
+
+        if (Atr_CalcStartPrice) then
+
+            local ok, value =
+                pcall (
+                    Atr_CalcStartPrice,
+                    recommended
+                );
+
+            if (
+                ok
+                and type(value) == "number"
+                and value > 0
+            ) then
+                startPrice = value;
+            end
+        end
+
+        MoneyInputFrame_SetCopper (
+            Atr_StartingPrice,
+            startPrice * stackSize
+        );
+    end
+
+    -- This is only an immediate database fallback. Auctionator's normal
+    -- live search still runs and may replace these fields with fresher
+    -- AH data when that search completes.
+    if (Atr_Recommend_Basis_Text) then
+
+        Atr_Recommend_Basis_Text:SetText (
+            "(based on refreshed Auctionator scan data)"
+        );
+
+        Atr_Recommend_Basis_Text:SetTextColor (
+            0.8,
+            0.8,
+            1.0
+        );
+    end
+end
+
+-----------------------------------------
+-- Full Scan dialog mask
+-----------------------------------------
+
+local gAtr_FullScanMaskOriginal = nil;
+
+local function Atr_FullScanRememberMaskLayout ()
+
+    if (
+        not Atr_Mask
+        or gAtr_FullScanMaskOriginal
+    ) then
+        return;
+    end
+
+    local point, relativeTo, relativePoint, x, y =
+        Atr_Mask:GetPoint (1);
+
+    gAtr_FullScanMaskOriginal = {
+        width         = Atr_Mask:GetWidth(),
+        height        = Atr_Mask:GetHeight(),
+        alpha         = Atr_Mask:GetAlpha(),
+        point         = point,
+        relativeTo    = relativeTo,
+        relativePoint = relativePoint,
+        x             = x,
+        y             = y
+    };
+end
+
+-----------------------------------------
+
+local function Atr_FullScanUseCompactMask ()
+
+    if (
+        not Atr_Mask
+        or not Atr_FullScanFrame
+    ) then
+        return;
+    end
+
+    Atr_FullScanRememberMaskLayout();
+
+    -- Keep only a small dimmed area immediately behind the Full Scan
+    -- dialog. The rest of the Auction House remains fully interactive,
+    -- including its Close button.
+    Atr_Mask:ClearAllPoints();
+
+    Atr_Mask:SetWidth (
+        Atr_FullScanFrame:GetWidth() + 20
+    );
+
+    Atr_Mask:SetHeight (
+        Atr_FullScanFrame:GetHeight() + 20
+    );
+
+    Atr_Mask:SetPoint (
+        "CENTER",
+        Atr_FullScanFrame,
+        "CENTER",
+        0,
+        0
+    );
+
+    -- Keep a subtle visual separation from the Auction House without
+    -- dimming the entire window.
+    Atr_Mask:SetAlpha (0.45);
+    Atr_Mask:Show();
+end
+
+-----------------------------------------
+
+local function Atr_FullScanRestoreMaskLayout ()
+
+    if (
+        not Atr_Mask
+        or not gAtr_FullScanMaskOriginal
+    ) then
+        return;
+    end
+
+    local saved =
+        gAtr_FullScanMaskOriginal;
+
+    Atr_Mask:ClearAllPoints();
+
+    Atr_Mask:SetWidth (
+        saved.width
+    );
+
+    Atr_Mask:SetHeight (
+        saved.height
+    );
+
+    Atr_Mask:SetPoint (
+        saved.point or "TOPLEFT",
+        saved.relativeTo or UIParent,
+        saved.relativePoint or saved.point or "TOPLEFT",
+        saved.x or 0,
+        saved.y or 0
+    );
+
+    Atr_Mask:SetAlpha (
+        saved.alpha or 1
+    );
+end
+
+-----------------------------------------
 -- Full Scan dialog
 -----------------------------------------
 
 function Atr_ShowFullScanFrame()
+
+    local quickButton = Atr_QuickRefreshEnsureButton();
+    quickButton:Show();
+
+    local clearButton = Atr_ClearDatabaseEnsureButton();
+    clearButton:Show();
+
+    -- Auctionator normally stretches Atr_Mask across the whole Auction
+    -- House while this dialog is open. Restrict it to a small area just
+    -- behind this dialog so the surrounding AH UI (including Close)
+    -- remains usable.
+    if (
+        Atr_FullScanFrame
+        and not Atr_FullScanFrame.atrCompactMaskHooked
+    ) then
+
+        Atr_FullScanFrame.atrCompactMaskHooked = true;
+
+        Atr_FullScanFrame:HookScript (
+            "OnShow",
+            function ()
+                Atr_FullScanUseCompactMask();
+            end
+        );
+
+        Atr_FullScanFrame:HookScript (
+            "OnHide",
+            function ()
+                Atr_FullScanRestoreMaskLayout();
+            end
+        );
+    end
 
     -- Keep multi-line scan information on the left side of the
     -- dialog. The original XML leaves this FontString unconstrained,
@@ -2537,25 +5319,27 @@ function Atr_ShowFullScanFrame()
         Atr_FullScanStatus:SetJustifyV ("TOP");
     end
 
-    -- Give the three-line yellow scan status some breathing room
-    -- before the explanatory grey text below it.
+    -- The stock SimpleHTML control does not clip long content cleanly
+    -- in this WotLK client. Use a proper scroll frame for the help text
+    -- so it always remains inside the Full Scan dialog.
     if (Atr_FullScanHTML) then
-        Atr_FullScanHTML:ClearAllPoints();
-        Atr_FullScanHTML:SetPoint (
-            "TOPLEFT",
-            Atr_FullScanFrame,
-            "TOPLEFT",
-            27,
-            -190
-        );
-        Atr_FullScanHTML:SetWidth (405);
-        Atr_FullScanHTML:SetHeight (285);
+        Atr_FullScanHTML:Hide();
     end
 
-    Atr_FullScanHTML:Show();
+    local helpScroll =
+        Atr_FullScanEnsureHelpScroll();
+
+    Atr_FullScanUpdateHelpText();
+    helpScroll:Show();
+
     Atr_FullScanResults:Hide();
 
     Atr_FullScanFrame:Show();
+
+    -- Apply immediately as well as through the OnShow hook so this
+    -- works on the first opening after installing the patch.
+    Atr_FullScanUseCompactMask();
+
     Atr_FullScanFrame:SetBackdropColor(
         0,
         0,
@@ -2576,18 +5360,6 @@ function Atr_ShowFullScanFrame()
         Atr_FullScanStatus:SetText ("");
 
     end
-
-    local expText =
-        "<html><body>"
-        .. "<p>"
-        .. ZT("Scanning is entirely optional.")
-        .. "<br/><br/>"
-        .. ZT("SCAN_EXPLANATION")
-        .. "</p>"
-        .. "</body></html>";
-
-    Atr_FullScanHTML:SetText (expText);
-    Atr_FullScanHTML:SetSpacing (3);
 
 end
 
@@ -2619,6 +5391,29 @@ function Atr_UpdateFullScanFrame()
     local canQuery =
         CanSendAuctionQuery();
 
+    local quickButton =
+        _G["Atr_QuickRefreshButton"];
+
+    local clearButton =
+        _G["Atr_ClearDatabaseButton"];
+
+    if (clearButton) then
+
+        if (
+            gAtr_FullScanState == ATR_FS_NULL
+            and not gAtr_QuickRefreshActive
+            and (
+                Atr_GetDBsize() > 0
+                or Atr_FullScanGetCheckpoint()
+            )
+        ) then
+            clearButton:Enable();
+        else
+            clearButton:Disable();
+        end
+
+    end
+
     if (gAtr_FullScanState == ATR_FS_NULL) then
 
         local checkpoint =
@@ -2631,6 +5426,20 @@ function Atr_UpdateFullScanFrame()
             );
 
             Atr_FullScanStartButton:Enable();
+
+            -- A saved Full Scan checkpoint is passive data only.
+            -- Quick Refresh may safely run while that scan is paused;
+            -- the checkpoint remains untouched and Resume Scan will
+            -- still continue from the same saved page afterwards.
+            if (quickButton) then
+
+                if (canQuery) then
+                    quickButton:Enable();
+                else
+                    quickButton:Disable();
+                end
+
+            end
 
             if (checkpoint.phase == "build") then
 
@@ -2686,6 +5495,10 @@ function Atr_UpdateFullScanFrame()
                     ZT("Now")
                 );
 
+                if (quickButton) then
+                    quickButton:Enable();
+                end
+
             else
 
                 Atr_FullScanStartButton:Disable();
@@ -2693,6 +5506,10 @@ function Atr_UpdateFullScanFrame()
                 Atr_FullScanNext:SetText (
                     ZT("waiting for auction query")
                 );
+
+                if (quickButton) then
+                    quickButton:Disable();
+                end
 
             end
 
@@ -2702,14 +5519,27 @@ function Atr_UpdateFullScanFrame()
 
         Atr_FullScanStartButton:Disable();
 
-        Atr_FullScanNext:SetText (
-            "Scanning"
-        );
+        if (quickButton) then
+            quickButton:Disable();
+        end
+
+        if (gAtr_QuickRefreshActive) then
+
+            Atr_FullScanNext:SetText (
+                "Quick Refresh"
+            );
+
+        else
+
+            Atr_FullScanNext:SetText (
+                "Scanning"
+            );
+
+        end
 
     end
 
 end
-
 -----------------------------------------
 
 function Atr_FullScan_GetDurString()
@@ -2758,11 +5588,113 @@ gAtr_FullScanLifecycleFrame:RegisterEvent (
     "PLAYER_LOGOUT"
 );
 
+gAtr_FullScanLifecycleFrame:RegisterEvent (
+    "BANKFRAME_OPENED"
+);
+
+gAtr_FullScanLifecycleFrame:RegisterEvent (
+    "BANKFRAME_CLOSED"
+);
+
+gAtr_FullScanLifecycleFrame:RegisterEvent (
+    "PLAYERBANKSLOTS_CHANGED"
+);
+
+gAtr_FullScanLifecycleFrame:RegisterEvent (
+    "BAG_UPDATE"
+);
+
+gAtr_FullScanLifecycleFrame:RegisterEvent (
+    "ADDON_LOADED"
+);
+
+gAtr_FullScanLifecycleFrame:RegisterEvent (
+    "NEW_AUCTION_UPDATE"
+);
+
 gAtr_FullScanLifecycleFrame:SetScript (
     "OnEvent",
-    function (self, event)
+    function (self, event, ...)
 
+        -- ------------------------------------------------------
+        -- Install tooltip hooks after every Auctionator file has
+        -- finished loading. AuctionatorHints.lua loads after this
+        -- file, so hooking on ADDON_LOADED keeps our line underneath
+        -- the original Auction / Disenchant tooltip information.
+        -- ------------------------------------------------------
+        if (event == "ADDON_LOADED") then
+
+            local loadedAddon =
+                select (1, ...);
+
+            if (
+                loadedAddon == addonName
+                or loadedAddon == "Auctionator"
+            ) then
+
+                Atr_InstallRecommendedSellTooltipHooks();
+
+                self:UnregisterEvent (
+                    "ADDON_LOADED"
+                );
+            end
+
+            return;
+        end
+
+        -- ------------------------------------------------------
+        -- When an item is placed in Auctionator's Sell pane, fill
+        -- the price fields immediately from Quick Refresh / Full
+        -- Scan data. Auctionator's normal live AH search may replace
+        -- this with fresher information a moment later.
+        -- ------------------------------------------------------
+        if (event == "NEW_AUCTION_UPDATE") then
+
+            Atr_PrefillSellPriceFromDatabase();
+            return;
+        end
+
+        -- ------------------------------------------------------
+        -- Keep a persistent bank snapshot for Quick Refresh.
+        -- ------------------------------------------------------
+        if (event == "BANKFRAME_OPENED") then
+
+            gAtr_QuickRefreshBankOpen = true;
+            Atr_QuickRefreshSnapshotBank();
+            return;
+        end
+
+        if (event == "BANKFRAME_CLOSED") then
+
+            -- Keep the last valid snapshot captured while the bank
+            -- was open. Some 3.3.5 clients clear bank containers
+            -- before BANKFRAME_CLOSED is dispatched.
+            gAtr_QuickRefreshBankOpen = false;
+            return;
+        end
+
+        if (
+            gAtr_QuickRefreshBankOpen
+            and (
+                event == "PLAYERBANKSLOTS_CHANGED"
+                or event == "BAG_UPDATE"
+            )
+        ) then
+
+            Atr_QuickRefreshSnapshotBank();
+            return;
+        end
+
+        -- ------------------------------------------------------
+        -- SavedVariables are flushed by WoW on normal logout.
+        -- Quick Refresh itself needs no resume checkpoint because
+        -- every completed item is committed immediately.
+        -- ------------------------------------------------------
         if (event == "PLAYER_LOGOUT") then
+
+            if (gAtr_QuickRefreshActive) then
+                return;
+            end
 
             if (
                 gAtr_FullScanState
@@ -2787,35 +5719,51 @@ gAtr_FullScanLifecycleFrame:SetScript (
             return;
         end
 
-        if (
-            event == "AUCTION_HOUSE_CLOSED"
-            and (
+        if (event == "AUCTION_HOUSE_CLOSED") then
+
+            -- Restore Auctionator's original mask geometry/opacity so
+            -- other dialogs continue to behave exactly as before.
+            Atr_FullScanRestoreMaskLayout();
+
+            if (gAtr_QuickRefreshActive) then
+
+                Atr_QuickRefreshStop (
+                    "Quick Refresh stopped: Auction House closed. Completed item prices were kept."
+                );
+
+                return;
+            end
+
+            if (
                 gAtr_FullScanState
                     == ATR_FS_STARTED
                 or gAtr_FullScanState
                     == ATR_FS_ANALYZING
-            )
-        ) then
+            ) then
 
-            Atr_FullScanPause (
-                string.format (
-                    "Paused | %s auctions saved | reopen AH to resume",
-                    Atr_FullScanFormatNumber (
-                        gAtr_FullScanAuctionsScanned
+                Atr_FullScanPause (
+                    string.format (
+                        "Paused | %s auctions saved | reopen AH to resume",
+                        Atr_FullScanFormatNumber (
+                            gAtr_FullScanAuctionsScanned
+                        )
                     )
-                )
-            );
-
+                );
+            end
         end
 
     end
 );
-
 -----------------------------------------
 -- OnUpdate driver
 -----------------------------------------
 
 function Atr_FullScanFrameIdle()
+
+    if (gAtr_QuickRefreshActive) then
+        Atr_QuickRefreshFrameIdle();
+        return;
+    end
 
     -- ==========================================================
     -- Active page scan
